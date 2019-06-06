@@ -107,7 +107,9 @@ class DataLoader():
             else:
                 return self.valid_data[idx]
 
-    def aug_data(self):
+    def aug_data(self,data):
+
+        return data
         # proscess self.trian_data self.label
         #flipped
         # if self.config.flipped:
@@ -120,7 +122,7 @@ class DataLoader():
         #         'label': label,
         #         'label_resize': label_re
         #     })
-        pass
+
 
     def append_flipped_images(self):
         num_images = self.num_images
