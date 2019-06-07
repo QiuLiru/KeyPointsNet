@@ -18,12 +18,12 @@ from checkpoint import save_models
 cfg = type('', (), {})()
 
 cfg.use_train_for_val = False
-# cfg.train_idx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
-cfg.train_idx = range(20)
+cfg.train_idx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+# cfg.train_idx = range(20)
 cfg.valid_idx = [idx for idx in range(60) if idx not in cfg.train_idx]
 cfg.bound_limit = 4
 cfg.out_range = 30
-cfg.gaussian_r = 4
+cfg.gaussian_r = 6
 
 cfg.lr = 0.0001
 cfg.weight_decay = 0
@@ -89,6 +89,7 @@ class DataLoader():
         target_map = self.target_map(label_resize, img_new_shape)
 
         return {
+            'name':pics[inx][0],
             'img': img.reshape(img.shape[0], img.shape[1], 1),
             'img_resize': img_resize.reshape(1, -1, img_resize.shape[0], img_resize.shape[1]),
             'label': label,
@@ -366,16 +367,94 @@ class NetV2(nn.Module):
     def predict(self, map):
         pass
 
+class NetV3(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.name = 'KeyPointV3'
+        self.config = config
+        self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
+        self.bn_1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn_2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.bn_3 = nn.BatchNorm2d(128)
+        self.pool3 = nn.MaxPool2d(2, 2)
+        self.conv4 = nn.Conv2d(128, 128, 3, padding=1)
+        self.bn_4 = nn.BatchNorm2d(128)
+        self.pool4 = nn.MaxPool2d(2, 2)
+        self.deconv1 = nn.ConvTranspose2d(128, 128, (3, 3), 2, padding=1, output_padding=1)
+        self.bn_de_1 = nn.BatchNorm2d(128)
+        self.deconv2 = nn.ConvTranspose2d(256, 64, (3, 3), 2, padding=1, output_padding=1)
+        self.bn_de_2 = nn.BatchNorm2d(64)
+        self.conv5 = nn.Conv2d(64, 1, (1, 1))
+
+        self.loss = nn.L1Loss()
+
+    def forward(self, item, train=True):
+        # input H W:256*128*1
+        input = item[0]
+
+        conv1 = F.relu(self.bn_1(self.conv1(input)))
+        conv2 = F.relu(self.bn_2(self.conv2(conv1)))
+        conv3 = F.relu(self.bn_3(self.conv3(conv2)))
+        MaxP3 = self.pool3(conv3)
+        conv4 = F.relu(self.bn_4(self.conv4(MaxP3)))
+        MaxP4 = self.pool4(conv4)
+
+        deconv1 = F.relu(self.bn_de_1(self.deconv1(MaxP4)))
+        cat1=torch.cat((deconv1,conv4),1)
+
+        deconv2 = F.relu(self.bn_de_2(self.deconv2(cat1)))
+        #cat2 = torch.cat((deconv2, conv3), 1)
+
+        conv5 = F.relu(self.conv5(deconv2))
+        map = conv5[0, 0, ...]
+        # top_indice = torch.argmax(top_map)
+        # top_pos1 = torch.as_tensor([top_indice % top_map.shape[1], top_indice / top_map.shape[1]],device=top_indice.device, dtype=torch.float32)
+
+        if train:
+            loss = self.loss(map, item[1])
+            return loss
+        else:
+            ###########
+            # h1=int(item[1][1].item())
+            # w1=int(item[1][0].item())
+            # ctr1=(w1,h1)
+            #
+            # h2=int(item[1][3].item())
+            # w2=int(item[1][2].item())
+            # ctr2=(w2,h2)
+            #
+            # fake_pred=get_fake_pred(ctr1,ctr2,map.shape,radius=self.config.gaussian_r)
+            # map=torch.as_tensor(fake_pred,dtype=torch.float,device=map.device)
+            ###########
+            map_array = map.reshape(-1)
+            map_ar = map_array.cpu().detach().numpy()
+            map_idx = np.argsort(map_ar)[::-1]
+            pos1 = [map_idx[0] % map.shape[1], map_idx[0] // map.shape[1]]
+            for x in map_idx[1:]:
+                pos2 = [x % map.shape[1], x // map.shape[1]]
+                if np.abs(pos2[1] - pos1[1]) > self.config.out_range:
+                    break
+
+            pos = torch.as_tensor(np.hstack((pos1, pos2)), device=map.device, dtype=torch.float32)
+
+            return pos, map.cpu().detach().numpy()
+
+    def predict(self, map):
+        pass
+
 
 class TrainProcessor():
     def __init__(self, config):
         self.config = config
         self.data = DataLoader(config)
-        self.net = NetV2(config)
+        self.net = NetV3(config)
         root_dir = pathlib.Path('./../')
         log_dir_name = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         log_dir = root_dir / 'summary' / log_dir_name
         self.eval_checkpoint_dir = log_dir / 'eval_checkpoint'
+        self.img_box_dir = log_dir / 'img_box'
         log_dir.mkdir(parents=True, exist_ok=True)
         self.eval_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(str(log_dir))
@@ -428,6 +507,35 @@ class TrainProcessor():
 
         return single_acc, error
 
+    def draw_result(self, pos, item, dir):
+        w1=pos[0]*10
+        h1=pos[1]*4
+        w2=pos[2]*10
+        h2=pos[3]*4
+
+        img=np.concatenate((item['img'],item['img'],item['img']),2)
+        name=item['name']
+
+        img_box=cv2.circle(img,(w1,h1), 5, (0,0,255), -1)
+        img_box = cv2.circle(img_box, (w2, h2), 5, (0, 0, 255), -1)
+
+        pic_name = os.path.join(dir, name +'_result1.jpg')
+        cv2.imwrite(pic_name, img_box)
+
+    def draw_feature_map(self,feature,input,save_dir):
+        feature=feature.squeeze()
+        name=input['name']
+        origin_img=input['img_resize'].squeeze()[..., np.newaxis]
+        origin_img_3C=np.concatenate((origin_img,origin_img,origin_img),axis=2)
+
+        cv2.imshow('a',feature)
+        cv2.imshow('b',origin_img_3C)
+        combination=feature*0.5+origin_img_3C*0.5
+        pic_name = os.path.join(save_dir, name +'_result1.jpg')
+        cv2.imwrite(pic_name, combination)
+        cv2.imshow('a+b',combination)
+        cv2.waitKey()
+
     def training(self):
         self.net.cuda()
         global_step = 0
@@ -458,20 +566,26 @@ class TrainProcessor():
                 correct = 0.00
                 single_correct = 0.0
                 total_error=0.0
+                image_out_dir = pathlib.Path(os.path.join(self.img_box_dir, str(epoch)))
+                image_out_dir.mkdir(parents=True, exist_ok=True)
 
                 number = 20 if self.config.use_train_for_val else 40
                 for idx in range(number):  #
                     val_item = self.data.getItem(idx, train=False)
                     val_item_cuda = self.convert_tensor(val_item)
                     val_pos, map_np = self.net(val_item_cuda, train=False)
+
+                    #draw box
+
+                    # self.draw_result(val_pos, val_item, str(image_out_dir))
+
                     # ---------draw image in tensorboard------------
                     map_norm = np.zeros_like(map_np[..., np.newaxis])
                     cv2.normalize(map_np[..., np.newaxis], map_norm, alpha=1, beta=0, norm_type=cv2.NORM_MINMAX)
                     map_norm_255=(map_norm* 255).astype(np.uint8)
                     map_norm_255_jet = cv2.applyColorMap(map_norm_255, colormap=cv2.COLORMAP_JET)[np.newaxis, ...]
-                    # if epoch >40:
-                    #     cv2.imshow('a',map_norm_255_jet[0])
-                    #     cv2.waitKey()
+                    if epoch>120:
+                        self.draw_feature_map(map_norm_255_jet,val_item,str(image_out_dir))
                     self.writer.add_images("EvalMapIndex_" + str(idx), map_norm_255_jet, global_step=global_step, dataformats='NHWC')
                     # ----------------------------------------------
                     val_label = val_item_cuda[2]
