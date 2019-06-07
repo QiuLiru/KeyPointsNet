@@ -13,7 +13,7 @@ import numpy as np
 import inspect
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
-from checkpoint import save_models
+from checkpoint import save_models,restore
 
 cfg = type('', (), {})()
 
@@ -28,6 +28,8 @@ cfg.gaussian_r = 6
 cfg.lr = 0.0001
 cfg.weight_decay = 0
 cfg.flipped = True
+cfg.model_weight_path = '/home/icecola/Desktop/KeyPointsDet/model/KeyPointV3-25800.tckpt'
+cfg.model_optimizer_path = '/home/icecola/Desktop/KeyPointsDet/model/adam_optimizer-25800.tckpt'
 
 
 def get_pos_to_kw_map(func):
@@ -460,6 +462,11 @@ class TrainProcessor():
         self.writer = SummaryWriter(str(log_dir))
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         self.optimizer.name = 'adam_optimizer'
+        try:
+            restore(config.model_weight_path,self.net)
+            restore(config.model_optimizer_path,self.optimizer)
+        except :
+            print('Training the model from origin')
 
     def convert_tensor(self, tensor):
         device = torch.device("cuda:0")
@@ -519,7 +526,7 @@ class TrainProcessor():
         img_box=cv2.circle(img,(w1,h1), 5, (0,0,255), -1)
         img_box = cv2.circle(img_box, (w2, h2), 5, (0, 0, 255), -1)
 
-        pic_name = os.path.join(dir, name +'_result1.jpg')
+        pic_name = os.path.join(dir, name +'_result.bmp')
         cv2.imwrite(pic_name, img_box)
 
     def draw_feature_map(self,feature,input,save_dir):
@@ -527,13 +534,8 @@ class TrainProcessor():
         name=input['name']
         origin_img=input['img_resize'].squeeze()[..., np.newaxis]
         origin_img_3C=np.concatenate((origin_img,origin_img,origin_img),axis=2)
-
-        # cv2.imshow('a',feature)
-        # cv2.imshow('b',origin_img_3C)
         combination=feature*0.5+origin_img_3C*0.5
-        pic_name = os.path.join(save_dir, name +'_result1.jpg')
-        cv2.imwrite(pic_name+'1.jpg', feature)
-        cv2.imwrite(pic_name+'2.jpg', origin_img_3C)
+        pic_name = os.path.join(save_dir, name +'_featureMap.bmp')
         cv2.imwrite(pic_name, combination)
         # cv2.imshow('a+b',combination)
         # cv2.waitKey()
@@ -544,7 +546,11 @@ class TrainProcessor():
         for epoch in range(2000):
             self.net.train()
             self.optimizer.zero_grad()
-            for idx in range(20):  # 20
+            if epoch==0:
+                train_length=0
+            else:
+                train_length=20
+            for idx in range(train_length):  # 20
                 item = self.data.getItem(idx, train=True)
                 item_cuda = self.convert_tensor(item)
 
@@ -558,11 +564,11 @@ class TrainProcessor():
                     print('global_step: %5d ,  loss: %.6f' % (global_step, loss.item()))
                 global_step += 1
 
-            if (epoch + 1) % 50 == 0:
+            if (epoch) % 30 == 0:
                 pass
                 save_models(self.eval_checkpoint_dir, [self.net, self.optimizer], global_step, max_to_keep=1000)
 
-            if (epoch + 1) % 20 == 0:
+            if (epoch) % 30 == 0:
                 self.net.eval()
                 #### eval #####
                 correct = 0.00
@@ -573,13 +579,15 @@ class TrainProcessor():
                 for idx in range(number):  #
                     val_item = self.data.getItem(idx, train=False)
                     val_item_cuda = self.convert_tensor(val_item)
+                    t=time.time()
                     val_pos, map_np = self.net(val_item_cuda, train=False)
+                    cost=time.time()-t
                     # ---------draw image in tensor-board and save ------------
                     map_norm = np.zeros_like(map_np[..., np.newaxis])
                     cv2.normalize(map_np[..., np.newaxis], map_norm, alpha=1, beta=0, norm_type=cv2.NORM_MINMAX)
                     map_norm_255=(map_norm* 255).astype(np.uint8)
                     map_norm_255_jet = cv2.applyColorMap(map_norm_255, colormap=cv2.COLORMAP_JET)[np.newaxis, ...]
-                    if epoch>1900:
+                    if True:
                         image_out_dir = pathlib.Path(os.path.join(self.img_box_dir, str(epoch)))
                         image_out_dir.mkdir(parents=True, exist_ok=True)
                         self.draw_result(val_pos, val_item, str(image_out_dir))
