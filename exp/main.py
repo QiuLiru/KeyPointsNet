@@ -528,13 +528,15 @@ class TrainProcessor():
         origin_img=input['img_resize'].squeeze()[..., np.newaxis]
         origin_img_3C=np.concatenate((origin_img,origin_img,origin_img),axis=2)
 
-        cv2.imshow('a',feature)
-        cv2.imshow('b',origin_img_3C)
+        # cv2.imshow('a',feature)
+        # cv2.imshow('b',origin_img_3C)
         combination=feature*0.5+origin_img_3C*0.5
         pic_name = os.path.join(save_dir, name +'_result1.jpg')
+        cv2.imwrite(pic_name+'1.jpg', feature)
+        cv2.imwrite(pic_name+'2.jpg', origin_img_3C)
         cv2.imwrite(pic_name, combination)
-        cv2.imshow('a+b',combination)
-        cv2.waitKey()
+        # cv2.imshow('a+b',combination)
+        # cv2.waitKey()
 
     def training(self):
         self.net.cuda()
@@ -566,25 +568,21 @@ class TrainProcessor():
                 correct = 0.00
                 single_correct = 0.0
                 total_error=0.0
-                image_out_dir = pathlib.Path(os.path.join(self.img_box_dir, str(epoch)))
-                image_out_dir.mkdir(parents=True, exist_ok=True)
 
                 number = 20 if self.config.use_train_for_val else 40
                 for idx in range(number):  #
                     val_item = self.data.getItem(idx, train=False)
                     val_item_cuda = self.convert_tensor(val_item)
                     val_pos, map_np = self.net(val_item_cuda, train=False)
-
-                    #draw box
-
-                    # self.draw_result(val_pos, val_item, str(image_out_dir))
-
-                    # ---------draw image in tensorboard------------
+                    # ---------draw image in tensor-board and save ------------
                     map_norm = np.zeros_like(map_np[..., np.newaxis])
                     cv2.normalize(map_np[..., np.newaxis], map_norm, alpha=1, beta=0, norm_type=cv2.NORM_MINMAX)
                     map_norm_255=(map_norm* 255).astype(np.uint8)
                     map_norm_255_jet = cv2.applyColorMap(map_norm_255, colormap=cv2.COLORMAP_JET)[np.newaxis, ...]
-                    if epoch>120:
+                    if epoch>1900:
+                        image_out_dir = pathlib.Path(os.path.join(self.img_box_dir, str(epoch)))
+                        image_out_dir.mkdir(parents=True, exist_ok=True)
+                        self.draw_result(val_pos, val_item, str(image_out_dir))
                         self.draw_feature_map(map_norm_255_jet,val_item,str(image_out_dir))
                     self.writer.add_images("EvalMapIndex_" + str(idx), map_norm_255_jet, global_step=global_step, dataformats='NHWC')
                     # ----------------------------------------------
