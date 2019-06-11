@@ -20,21 +20,6 @@ import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 
 
-class DelayedKeyboardInterrupt(object):
-    def __enter__(self):
-        self.signal_received = False
-        self.old_handler = signal.signal(signal.SIGINT, self.handler)
-
-    def handler(self, sig, frame):
-        self.signal_received = (sig, frame)
-        logging.debug('SIGINT received. Delaying KeyboardInterrupt.')
-
-    def __exit__(self, type, value, traceback):
-        signal.signal(signal.SIGINT, self.old_handler)
-        if self.signal_received:
-            self.old_handler(*self.signal_received)
-
-
 class Net(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -248,7 +233,7 @@ class NetV3(nn.Module):
         self.bn_de_2 = nn.BatchNorm2d(64)
         self.conv5 = nn.Conv2d(64, 1, (1, 1))
 
-        self.loss = nn.SmoothL1Loss()
+        self.loss = nn.L1Loss()
 
     def forward(self, item, train=True):
         # input H W:256*128*1
@@ -319,10 +304,9 @@ class NetV3(nn.Module):
             return model_name
 
         models = [self, optimizer]
-        with DelayedKeyboardInterrupt():
-            name_to_model = _get_name_to_model_map(models)
-            for name, model in name_to_model.items():
-                self._save(eval_checkpoint_dir, model, name, global_step, max_to_keep=1000, keep_latest=True)
+        name_to_model = _get_name_to_model_map(models)
+        for name, model in name_to_model.items():
+            self._save(eval_checkpoint_dir, model, name, global_step, max_to_keep=1000, keep_latest=True)
 
     def restore(self, weight_path, optimizer_path, optimizer):
         if not Path(weight_path).is_file():
@@ -362,44 +346,43 @@ class NetV3(nn.Module):
             return [x for x in seq if not (x in seen or seen.add(x))]
 
         # prevent save incomplete checkpoint due to key interrupt
-        with DelayedKeyboardInterrupt():
-            ckpt_info_path = Path(model_dir) / "checkpoints.json"
-            ckpt_filename = "{}-{}.tckpt".format(model_name, global_step)
-            ckpt_path = Path(model_dir) / ckpt_filename
-            if not ckpt_info_path.is_file():
-                ckpt_info_dict = {'latest_ckpt': {}, 'all_ckpts': {}}
-            else:
-                with open(ckpt_info_path, 'r') as f:
-                    ckpt_info_dict = json.loads(f.read())
-            ckpt_info_dict['latest_ckpt'][model_name] = ckpt_filename
-            if model_name in ckpt_info_dict['all_ckpts']:
-                ckpt_info_dict['all_ckpts'][model_name].append(ckpt_filename)
-            else:
-                ckpt_info_dict['all_ckpts'][model_name] = [ckpt_filename]
-            all_ckpts = ckpt_info_dict['all_ckpts'][model_name]
+        ckpt_info_path = Path(model_dir) / "checkpoints.json"
+        ckpt_filename = "{}-{}.tckpt".format(model_name, global_step)
+        ckpt_path = Path(model_dir) / ckpt_filename
+        if not ckpt_info_path.is_file():
+            ckpt_info_dict = {'latest_ckpt': {}, 'all_ckpts': {}}
+        else:
+            with open(ckpt_info_path, 'r') as f:
+                ckpt_info_dict = json.loads(f.read())
+        ckpt_info_dict['latest_ckpt'][model_name] = ckpt_filename
+        if model_name in ckpt_info_dict['all_ckpts']:
+            ckpt_info_dict['all_ckpts'][model_name].append(ckpt_filename)
+        else:
+            ckpt_info_dict['all_ckpts'][model_name] = [ckpt_filename]
+        all_ckpts = ckpt_info_dict['all_ckpts'][model_name]
 
-            torch.save(model.state_dict(), ckpt_path)
-            # check ckpt in all_ckpts is exist, if not, delete it from all_ckpts
-            all_ckpts_checked = []
-            for ckpt in all_ckpts:
-                ckpt_path_uncheck = Path(model_dir) / ckpt
-                if ckpt_path_uncheck.is_file():
-                    all_ckpts_checked.append(str(ckpt_path_uncheck))
-            all_ckpts = all_ckpts_checked
-            if len(all_ckpts) > max_to_keep:
-                if keep_latest:
-                    ckpt_to_delete = all_ckpts.pop(0)
-                else:
-                    # delete smallest step
-                    get_step = lambda name: int(name.split('.')[0].split('-')[1])
-                    min_step = min([get_step(name) for name in all_ckpts])
-                    ckpt_to_delete = "{}-{}.tckpt".format(model_name, min_step)
-                    all_ckpts.remove(ckpt_to_delete)
-                os.remove(str(Path(model_dir) / ckpt_to_delete))
-            all_ckpts_filename = _ordered_unique([Path(f).name for f in all_ckpts])
-            ckpt_info_dict['all_ckpts'][model_name] = all_ckpts_filename
-            with open(ckpt_info_path, 'w') as f:
-                f.write(json.dumps(ckpt_info_dict, indent=2))
+        torch.save(model.state_dict(), ckpt_path)
+        # check ckpt in all_ckpts is exist, if not, delete it from all_ckpts
+        all_ckpts_checked = []
+        for ckpt in all_ckpts:
+            ckpt_path_uncheck = Path(model_dir) / ckpt
+            if ckpt_path_uncheck.is_file():
+                all_ckpts_checked.append(str(ckpt_path_uncheck))
+        all_ckpts = all_ckpts_checked
+        if len(all_ckpts) > max_to_keep:
+            if keep_latest:
+                ckpt_to_delete = all_ckpts.pop(0)
+            else:
+                # delete smallest step
+                get_step = lambda name: int(name.split('.')[0].split('-')[1])
+                min_step = min([get_step(name) for name in all_ckpts])
+                ckpt_to_delete = "{}-{}.tckpt".format(model_name, min_step)
+                all_ckpts.remove(ckpt_to_delete)
+            os.remove(str(Path(model_dir) / ckpt_to_delete))
+        all_ckpts_filename = _ordered_unique([Path(f).name for f in all_ckpts])
+        ckpt_info_dict['all_ckpts'][model_name] = all_ckpts_filename
+        with open(ckpt_info_path, 'w') as f:
+            f.write(json.dumps(ckpt_info_dict, indent=2))
 
 
 class DataLoader(object):
@@ -700,3 +683,4 @@ if __name__ == "__main__":
 
     train = TrainProcessor(cfg)
     train.training()
+

@@ -1,0 +1,14 @@
+{
+  "latest_ckpt": {
+    "KeyPointV3": "KeyPointV3-25800.tckpt",
+    "adam_optimizer": "adam_optimizer-25800.tckpt"
+  },
+  "all_ckpts": {
+    "KeyPointV3": [
+      "KeyPointV3-25800.tckpt"
+    ],
+    "adam_optimizer": [
+      "adam_optimizer-25800.tckpt"
+    ]
+  }
+}
