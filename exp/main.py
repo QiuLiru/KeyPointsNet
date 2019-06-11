@@ -678,8 +678,8 @@ if __name__ == "__main__":
     cfg.weight_decay = 0
     cfg.flipped = True
     cfg.store_img = False
-    cfg.model_weight_path = '/home/icecola/Desktop/KeyPointsDet/model/KeyPointV3-25800.tckpt'
-    cfg.model_optimizer_path = '/home/icecola/Desktop/KeyPointsDet/model/adam_optimizer-25800.tckpt'
+    cfg.model_weight_path = '../FinalResult/KeyPointV3-25800.tckpt'
+    cfg.model_optimizer_path = '../FinalResult/adam_optimizer-25800.tckpt'
 
     train = TrainProcessor(cfg)
     train.training()
