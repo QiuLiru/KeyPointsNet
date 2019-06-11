@@ -1,175 +1,38 @@
-# -*-coding:utf-8-*-
+# KeyPoint mini network to detect object center, inspired by center-net
+# Author:qiuliru   916777544@qq.com
+# 2019-06-09
 
-from PIL import Image
-from PIL import ImageChops
-from PIL import ImageEnhance
+
 import cv2
-import time
-import pathlib
 import os
-from torch import nn
+import time
+import signal
+import logging
+import pathlib
+from pathlib import Path
+import json
+
 import torch
 import numpy as np
-import inspect
+from torch import nn
+from PIL import Image
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
-from checkpoint import save_models,restore
-
-cfg = type('', (), {})()
-
-cfg.use_train_for_val = False
-cfg.train_idx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
-# cfg.train_idx = range(20)
-cfg.valid_idx = [idx for idx in range(60) if idx not in cfg.train_idx]
-cfg.bound_limit = 4
-cfg.out_range = 30
-cfg.gaussian_r = 6
-
-cfg.lr = 0.0001
-cfg.weight_decay = 0
-cfg.flipped = True
-cfg.model_weight_path = '/home/icecola/Desktop/KeyPointsDet/model/KeyPointV3-25800.tckpt'
-cfg.model_optimizer_path = '/home/icecola/Desktop/KeyPointsDet/model/adam_optimizer-25800.tckpt'
 
 
-def get_pos_to_kw_map(func):
-    pos_to_kw = {}
-    fsig = inspect.signature(func)
-    pos = 0
-    for name, info in fsig.parameters.items():
-        if info.kind is info.POSITIONAL_OR_KEYWORD:
-            pos_to_kw[pos] = name
-        pos += 1
-    return pos_to_kw
+class DelayedKeyboardInterrupt(object):
+    def __enter__(self):
+        self.signal_received = False
+        self.old_handler = signal.signal(signal.SIGINT, self.handler)
 
+    def handler(self, sig, frame):
+        self.signal_received = (sig, frame)
+        logging.debug('SIGINT received. Delaying KeyboardInterrupt.')
 
-def change_default_args(**kwargs):
-    def layer_wrapper(layer_class):
-        class DefaultArgLayer(layer_class):
-            def __init__(self, *args, **kw):
-                pos_to_kw = get_pos_to_kw_map(layer_class.__init__)
-                kw_to_pos = {kw: pos for pos, kw in pos_to_kw.items()}
-                for key, val in kwargs.items():
-                    if key not in kw and kw_to_pos[key] > len(args):
-                        kw[key] = val
-                super().__init__(*args, **kw)
-
-        return DefaultArgLayer
-
-    return layer_wrapper
-
-
-class DataLoader():
-    def __init__(self, config):
-        self.config = config
-        with open('../data/anno', 'r') as f:
-            pics = [x.strip().split(" ") for x in f.readlines()]
-        self.train_data = [self.load_data(pics, inx) for inx in self.config.train_idx]
-        self.valid_data = [self.load_data(pics, inx) for inx in self.config.valid_idx]
-        self.train_seq = range(20)
-
-    def load_data(self, pics, inx):
-        if inx < 20:
-            dir = '../data/1_1'
-        elif inx < 40:
-            dir = '../data/2_2'
-        else:
-            dir = '../data/3_3'
-        img = cv2.imread(os.path.join(dir, pics[inx][0] + '.bmp'), cv2.IMREAD_GRAYSCALE)
-        # resize
-        img_new_shape = (int(img.shape[1] / 10), int(img.shape[0] / 4))
-        img_resize = cv2.resize(img, img_new_shape)
-        # cv2.imshow("a",img_resize)
-        # cv2.waitKey()
-        w1 = int(pics[inx][1])
-        h1 = int(pics[inx][2])
-        w2 = int(pics[inx][3])
-        h2 = int(pics[inx][4])
-        label = np.array([w1, h1, w2, h2], dtype=np.float32)
-
-        label_resize = np.array([w1 / 10, h1 / 4, w2 / 10, h2 / 4], dtype=np.float32)
-        target_map = self.target_map(label_resize, img_new_shape)
-
-        return {
-            'name':pics[inx][0],
-            'img': img.reshape(img.shape[0], img.shape[1], 1),
-            'img_resize': img_resize.reshape(1, -1, img_resize.shape[0], img_resize.shape[1]),
-            'label': label,
-            'label_resize': label_resize,
-            'target_map': target_map
-        }
-
-    def target_map(self, label, map_shape, radius=6):
-        w1, h1, w2, h2 = label[0], label[1], label[2], label[3]
-        target1 = np.array(
-            [[np.exp(-((x - w1) ** 2 + (y - h1) ** 2) / (2 * radius ** 2)) for x in range(map_shape[0])] for y in
-             range(map_shape[1])])
-        target2 = np.array(
-            [[np.exp(-((x - w2) ** 2 + (y - h2) ** 2) / (2 * radius ** 2)) for x in range(map_shape[0])] for y in
-             range(map_shape[1])])
-        target = target1 + target2
-
-        # cv2.imshow("a", target)
-        # cv2.waitKey()
-        return target
-
-    def getItem(self, idx, train=True):
-        # normalize gray value
-        if train:
-            if idx == 0:
-                np.random.permutation(self.train_seq)
-            return self.aug_data(self.train_data[self.train_seq[idx]])
-        else:
-            if self.config.use_train_for_val:
-                return self.train_data[idx]
-            else:
-                return self.valid_data[idx]
-
-    def aug_data(self, data):
-        img = data['img_resize'][0, 0, ...]
-        target = data['target_map']
-
-        # cv2.imshow("img", img)
-        # cv2.waitKey()
-        # clip
-        if np.random.choice([True, False]):
-            img_padding = cv2.copyMakeBorder(img, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=0)
-            target_padding = cv2.copyMakeBorder(target, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=0)
-            h = np.random.randint(0, 20)
-            w = np.random.randint(0, 20)
-            img = img_padding[h:h + img.shape[0], w:w + img.shape[1]]
-            target = target_padding[h:h + target.shape[0], w:w + target.shape[1]]
-
-        # x-flip
-        if np.random.choice([True, False]):
-            img = np.fliplr(img)
-            target = np.fliplr(target)
-
-        # y-flip
-        if np.random.choice([True, False]):
-            img = np.fliplr(img.T).T
-            target = np.fliplr(target.T).T
-
-        # rotate
-        if np.random.choice([True, False]):
-            img = Image.fromarray(img, mode="L")
-            target = Image.fromarray(data['target_map'])
-
-            angle = np.random.randint(-10, 10)
-            img = img.rotate(angle)
-            target = target.rotate(angle)
-
-            img = np.array(img)
-            target = np.array(target)
-
-        # cv2.imshow("img_o", img)
-        # cv2.waitKey()
-
-        return {
-            'img_resize': img.reshape(1, -1, img.shape[0], img.shape[1]),
-            'target_map': target,
-            'label_resize': data['label_resize']
-        }
+    def __exit__(self, type, value, traceback):
+        signal.signal(signal.SIGINT, self.old_handler)
+        if self.signal_received:
+            self.old_handler(*self.signal_received)
 
 
 class Net(nn.Module):
@@ -288,12 +151,6 @@ class Net(nn.Module):
         else:
             return pos
 
-    # def loss_l1(self,gt,det):
-
-    # def optimizer(self):
-
-    # self.optimizer=torch.optim.Adam()
-
 
 class NetV2(nn.Module):
     def __init__(self, config):
@@ -369,6 +226,7 @@ class NetV2(nn.Module):
     def predict(self, map):
         pass
 
+
 class NetV3(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -390,7 +248,7 @@ class NetV3(nn.Module):
         self.bn_de_2 = nn.BatchNorm2d(64)
         self.conv5 = nn.Conv2d(64, 1, (1, 1))
 
-        self.loss = nn.L1Loss()
+        self.loss = nn.SmoothL1Loss()
 
     def forward(self, item, train=True):
         # input H W:256*128*1
@@ -404,15 +262,13 @@ class NetV3(nn.Module):
         MaxP4 = self.pool4(conv4)
 
         deconv1 = F.relu(self.bn_de_1(self.deconv1(MaxP4)))
-        cat1=torch.cat((deconv1,conv4),1)
+        cat1 = torch.cat((deconv1, conv4), 1)
 
         deconv2 = F.relu(self.bn_de_2(self.deconv2(cat1)))
-        #cat2 = torch.cat((deconv2, conv3), 1)
+        # cat2 = torch.cat((deconv2, conv3), 1)
 
         conv5 = F.relu(self.conv5(deconv2))
         map = conv5[0, 0, ...]
-        # top_indice = torch.argmax(top_map)
-        # top_pos1 = torch.as_tensor([top_indice % top_map.shape[1], top_indice / top_map.shape[1]],device=top_indice.device, dtype=torch.float32)
 
         if train:
             loss = self.loss(map, item[1])
@@ -443,11 +299,223 @@ class NetV3(nn.Module):
 
             return pos, map.cpu().detach().numpy()
 
-    def predict(self, map):
-        pass
+    def save(self, eval_checkpoint_dir, optimizer, global_step):
+        def _check_model_names(models):
+            model_names = []
+            for model in models:
+                if not hasattr(model, "name"):
+                    raise ValueError("models must have name attr")
+                model_names.append(model.name)
+            if len(model_names) != len(set(model_names)):
+                raise ValueError("models must have unique name: {}".format(
+                    ", ".join(model_names)))
+
+        def _get_name_to_model_map(models):
+            if isinstance(models, dict):
+                model_name = {name: m for name, m in models.items()}
+            else:
+                _check_model_names(models)
+                model_name = {m.name: m for m in models}
+            return model_name
+
+        models = [self, optimizer]
+        with DelayedKeyboardInterrupt():
+            name_to_model = _get_name_to_model_map(models)
+            for name, model in name_to_model.items():
+                self._save(eval_checkpoint_dir, model, name, global_step, max_to_keep=1000, keep_latest=True)
+
+    def restore(self, weight_path, optimizer_path, optimizer):
+        if not Path(weight_path).is_file():
+            raise ValueError("checkpoint {} not exist.".format(weight_path))
+        self.load_state_dict(torch.load(weight_path))
+        print("Restoring parameters from {}".format(weight_path))
+
+        if not Path(optimizer_path).is_file():
+            raise ValueError("checkpoint {} not exist.".format(optimizer_path))
+        optimizer.load_state_dict(torch.load(optimizer_path))
+        print("Restoring parameters from {}".format(optimizer_path))
+
+    def _save(self,
+             model_dir,
+             model,
+             model_name,
+             global_step,
+             max_to_keep=8,
+             keep_latest=True):
+        """save a model into model_dir.
+        Args:
+            model_dir: string, indicate your model dir(save ckpts, summarys,
+                logs, etc).
+            model: torch.nn.Module instance.
+            model_name: name of your model. we find ckpts by name
+            global_step: int, indicate current global step.
+            max_to_keep: int, maximum checkpoints to keep.
+            keep_latest: bool, if True and there are too much ckpts,
+                will delete oldest ckpt. else will delete ckpt which has
+                smallest global step.
+        Returns:
+            path: None if isn't exist or latest checkpoint path.
+        """
+
+        def _ordered_unique(seq):
+            seen = set()
+            return [x for x in seq if not (x in seen or seen.add(x))]
+
+        # prevent save incomplete checkpoint due to key interrupt
+        with DelayedKeyboardInterrupt():
+            ckpt_info_path = Path(model_dir) / "checkpoints.json"
+            ckpt_filename = "{}-{}.tckpt".format(model_name, global_step)
+            ckpt_path = Path(model_dir) / ckpt_filename
+            if not ckpt_info_path.is_file():
+                ckpt_info_dict = {'latest_ckpt': {}, 'all_ckpts': {}}
+            else:
+                with open(ckpt_info_path, 'r') as f:
+                    ckpt_info_dict = json.loads(f.read())
+            ckpt_info_dict['latest_ckpt'][model_name] = ckpt_filename
+            if model_name in ckpt_info_dict['all_ckpts']:
+                ckpt_info_dict['all_ckpts'][model_name].append(ckpt_filename)
+            else:
+                ckpt_info_dict['all_ckpts'][model_name] = [ckpt_filename]
+            all_ckpts = ckpt_info_dict['all_ckpts'][model_name]
+
+            torch.save(model.state_dict(), ckpt_path)
+            # check ckpt in all_ckpts is exist, if not, delete it from all_ckpts
+            all_ckpts_checked = []
+            for ckpt in all_ckpts:
+                ckpt_path_uncheck = Path(model_dir) / ckpt
+                if ckpt_path_uncheck.is_file():
+                    all_ckpts_checked.append(str(ckpt_path_uncheck))
+            all_ckpts = all_ckpts_checked
+            if len(all_ckpts) > max_to_keep:
+                if keep_latest:
+                    ckpt_to_delete = all_ckpts.pop(0)
+                else:
+                    # delete smallest step
+                    get_step = lambda name: int(name.split('.')[0].split('-')[1])
+                    min_step = min([get_step(name) for name in all_ckpts])
+                    ckpt_to_delete = "{}-{}.tckpt".format(model_name, min_step)
+                    all_ckpts.remove(ckpt_to_delete)
+                os.remove(str(Path(model_dir) / ckpt_to_delete))
+            all_ckpts_filename = _ordered_unique([Path(f).name for f in all_ckpts])
+            ckpt_info_dict['all_ckpts'][model_name] = all_ckpts_filename
+            with open(ckpt_info_path, 'w') as f:
+                f.write(json.dumps(ckpt_info_dict, indent=2))
 
 
-class TrainProcessor():
+class DataLoader(object):
+    def __init__(self, config):
+        self.config = config
+        with open('../data/anno', 'r') as f:
+            pics = [x.strip().split(" ") for x in f.readlines()]
+        self.train_data = [self.load_data(pics, inx) for inx in self.config.train_idx]
+        self.valid_data = [self.load_data(pics, inx) for inx in self.config.valid_idx]
+        self.train_seq = range(20)
+
+    def load_data(self, pics, inx):
+        if inx < 20:
+            dir = '../data/1_1'
+        elif inx < 40:
+            dir = '../data/2_2'
+        else:
+            dir = '../data/3_3'
+        img = cv2.imread(os.path.join(dir, pics[inx][0] + '.bmp'), cv2.IMREAD_GRAYSCALE)
+        # resize
+        img_new_shape = (int(img.shape[1] / 10), int(img.shape[0] / 4))
+        img_resize = cv2.resize(img, img_new_shape)
+        # cv2.imshow("a",img_resize)
+        # cv2.waitKey()
+        w1 = int(pics[inx][1])
+        h1 = int(pics[inx][2])
+        w2 = int(pics[inx][3])
+        h2 = int(pics[inx][4])
+        label = np.array([w1, h1, w2, h2], dtype=np.float32)
+
+        label_resize = np.array([w1 / 10, h1 / 4, w2 / 10, h2 / 4], dtype=np.float32)
+        target_map = self.target_map(label_resize, img_new_shape)
+
+        return {
+            'name': pics[inx][0],
+            'img': img.reshape(img.shape[0], img.shape[1], 1),
+            'img_resize': img_resize.reshape(1, -1, img_resize.shape[0], img_resize.shape[1]),
+            'label': label,
+            'label_resize': label_resize,
+            'target_map': target_map
+        }
+
+    def target_map(self, label, map_shape, radius=6):
+        w1, h1, w2, h2 = label[0], label[1], label[2], label[3]
+        target1 = np.array(
+            [[np.exp(-((x - w1) ** 2 + (y - h1) ** 2) / (2 * radius ** 2)) for x in range(map_shape[0])] for y in
+             range(map_shape[1])])
+        target2 = np.array(
+            [[np.exp(-((x - w2) ** 2 + (y - h2) ** 2) / (2 * radius ** 2)) for x in range(map_shape[0])] for y in
+             range(map_shape[1])])
+        target = target1 + target2
+
+        # cv2.imshow("a", target)
+        # cv2.waitKey()
+        return target
+
+    def getItem(self, idx, train=True):
+        # normalize gray value
+        if train:
+            if idx == 0:
+                np.random.permutation(self.train_seq)
+            return self.aug_data(self.train_data[self.train_seq[idx]])
+        else:
+            if self.config.use_train_for_val:
+                return self.train_data[idx]
+            else:
+                return self.valid_data[idx]
+
+    def aug_data(self, data):
+        img = data['img_resize'][0, 0, ...]
+        target = data['target_map']
+
+        # cv2.imshow("img", img)
+        # cv2.waitKey()
+        # clip
+        if np.random.choice([True, False]):
+            img_padding = cv2.copyMakeBorder(img, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=0)
+            target_padding = cv2.copyMakeBorder(target, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=0)
+            h = np.random.randint(0, 20)
+            w = np.random.randint(0, 20)
+            img = img_padding[h:h + img.shape[0], w:w + img.shape[1]]
+            target = target_padding[h:h + target.shape[0], w:w + target.shape[1]]
+
+        # x-flip
+        if np.random.choice([True, False]):
+            img = np.fliplr(img)
+            target = np.fliplr(target)
+
+        # y-flip
+        if np.random.choice([True, False]):
+            img = np.fliplr(img.T).T
+            target = np.fliplr(target.T).T
+
+        # rotate
+        if np.random.choice([True, False]):
+            img = Image.fromarray(img, mode="L")
+            target = Image.fromarray(data['target_map'])
+
+            angle = np.random.randint(-10, 10)
+            img = img.rotate(angle)
+            target = target.rotate(angle)
+
+            img = np.array(img)
+            target = np.array(target)
+
+        # cv2.imshow("img_o", img)
+        # cv2.waitKey()
+
+        return {
+            'img_resize': img.reshape(1, -1, img.shape[0], img.shape[1]),
+            'target_map': target,
+            'label_resize': data['label_resize']
+        }
+
+
+class TrainProcessor(object):
     def __init__(self, config):
         self.config = config
         self.data = DataLoader(config)
@@ -463,9 +531,8 @@ class TrainProcessor():
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         self.optimizer.name = 'adam_optimizer'
         try:
-            restore(config.model_weight_path,self.net)
-            restore(config.model_optimizer_path,self.optimizer)
-        except :
+            self.net.restore(config.model_weight_path, config.model_optimizer_path, self.optimizer)
+        except:
             print('Training the model from origin')
 
     def convert_tensor(self, tensor):
@@ -474,9 +541,9 @@ class TrainProcessor():
         target_map = torch.as_tensor(np.ascontiguousarray(tensor['target_map'], dtype=np.float32), dtype=torch.float32,
                                      device=device)
         label_tsr = torch.as_tensor(tensor['label_resize'], dtype=torch.float32, device=device)
-        return (img_tsr, target_map, label_tsr)
+        return img_tsr, target_map, label_tsr
 
-    def junge(self, pos, label):
+    def judge(self, pos, label):
         bound = self.config.bound_limit
         single_acc = 0
         a = torch.abs(pos[0] - label[0]) < bound and torch.abs(pos[1] - label[1]) < bound
@@ -515,27 +582,27 @@ class TrainProcessor():
         return single_acc, error
 
     def draw_result(self, pos, item, dir):
-        w1=pos[0]*10
-        h1=pos[1]*4
-        w2=pos[2]*10
-        h2=pos[3]*4
+        w1 = pos[0] * 10
+        h1 = pos[1] * 4
+        w2 = pos[2] * 10
+        h2 = pos[3] * 4
 
-        img=np.concatenate((item['img'],item['img'],item['img']),2)
-        name=item['name']
+        img = np.concatenate((item['img'], item['img'], item['img']), 2)
+        name = item['name']
 
-        img_box=cv2.circle(img,(w1,h1), 5, (0,0,255), -1)
+        img_box = cv2.circle(img, (w1, h1), 5, (0, 0, 255), -1)
         img_box = cv2.circle(img_box, (w2, h2), 5, (0, 0, 255), -1)
 
-        pic_name = os.path.join(dir, name +'_result.bmp')
+        pic_name = os.path.join(dir, name + '_result.bmp')
         cv2.imwrite(pic_name, img_box)
 
-    def draw_feature_map(self,feature,input,save_dir):
-        feature=feature.squeeze()
-        name=input['name']
-        origin_img=input['img_resize'].squeeze()[..., np.newaxis]
-        origin_img_3C=np.concatenate((origin_img,origin_img,origin_img),axis=2)
-        combination=feature*0.5+origin_img_3C*0.5
-        pic_name = os.path.join(save_dir, name +'_featureMap.bmp')
+    def draw_feature_map(self, feature, input, save_dir):
+        feature = feature.squeeze()
+        name = input['name']
+        origin_img = input['img_resize'].squeeze()[..., np.newaxis]
+        origin_img_3C = np.concatenate((origin_img, origin_img, origin_img), axis=2)
+        combination = feature * 0.5 + origin_img_3C * 0.5
+        pic_name = os.path.join(save_dir, name + '_featureMap.bmp')
         cv2.imwrite(pic_name, combination)
         # cv2.imshow('a+b',combination)
         # cv2.waitKey()
@@ -546,10 +613,10 @@ class TrainProcessor():
         for epoch in range(2000):
             self.net.train()
             self.optimizer.zero_grad()
-            if epoch==0:
-                train_length=0
+            if epoch == 0:
+                train_length = 0
             else:
-                train_length=20
+                train_length = 20
             for idx in range(train_length):  # 20
                 item = self.data.getItem(idx, train=True)
                 item_cuda = self.convert_tensor(item)
@@ -566,45 +633,46 @@ class TrainProcessor():
 
             if (epoch) % 30 == 0:
                 pass
-                save_models(self.eval_checkpoint_dir, [self.net, self.optimizer], global_step, max_to_keep=1000)
+                self.net.save(self.eval_checkpoint_dir, self.optimizer, global_step)
 
             if (epoch) % 30 == 0:
                 self.net.eval()
-                #### eval #####
-                correct = 0.00
+                #------ eval -------
+                correct = 0.0
                 single_correct = 0.0
-                total_error=0.0
+                total_error = 0.0
 
                 number = 20 if self.config.use_train_for_val else 40
                 for idx in range(number):  #
                     val_item = self.data.getItem(idx, train=False)
                     val_item_cuda = self.convert_tensor(val_item)
-                    t=time.time()
+                    t = time.time()
                     val_pos, map_np = self.net(val_item_cuda, train=False)
-                    cost=time.time()-t
+                    cost = time.time() - t
                     # ---------draw image in tensor-board and save ------------
                     map_norm = np.zeros_like(map_np[..., np.newaxis])
                     cv2.normalize(map_np[..., np.newaxis], map_norm, alpha=1, beta=0, norm_type=cv2.NORM_MINMAX)
-                    map_norm_255=(map_norm* 255).astype(np.uint8)
+                    map_norm_255 = (map_norm * 255).astype(np.uint8)
                     map_norm_255_jet = cv2.applyColorMap(map_norm_255, colormap=cv2.COLORMAP_JET)[np.newaxis, ...]
-                    if True:
+                    if self.config.store_img:
                         image_out_dir = pathlib.Path(os.path.join(self.img_box_dir, str(epoch)))
                         image_out_dir.mkdir(parents=True, exist_ok=True)
                         self.draw_result(val_pos, val_item, str(image_out_dir))
-                        self.draw_feature_map(map_norm_255_jet,val_item,str(image_out_dir))
-                    self.writer.add_images("EvalMapIndex_" + str(idx), map_norm_255_jet, global_step=global_step, dataformats='NHWC')
+                        self.draw_feature_map(map_norm_255_jet, val_item, str(image_out_dir))
+                    self.writer.add_images("EvalMapIndex_" + str(idx), map_norm_255_jet, global_step=global_step,
+                                           dataformats='NHWC')
                     # ----------------------------------------------
                     val_label = val_item_cuda[2]
-                    single_acc, error = self.junge(val_pos, val_label)
+                    single_acc, error = self.judge(val_pos, val_label)
                     if single_acc > 0:
                         single_correct = single_correct + single_acc
-                        total_error+=error
+                        total_error += error
                         if single_acc == 2:
                             correct += 1
 
                 single_accuracy = single_correct / (number * 2)
                 accuracy = correct / number
-                total_error=total_error/(single_correct+1e-5)
+                total_error = total_error / (single_correct + 1e-5)
 
                 self.writer.add_scalar('accuracy', accuracy, global_step)
                 self.writer.add_scalar('single_accuracy', single_accuracy, global_step)
@@ -614,17 +682,21 @@ class TrainProcessor():
 
 
 if __name__ == "__main__":
+    cfg = type('', (), {})()
+
+    cfg.use_train_for_val = False
+    cfg.train_idx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+    cfg.valid_idx = [idx for idx in range(60) if idx not in cfg.train_idx]
+    cfg.bound_limit = 4
+    cfg.out_range = 30
+    cfg.gaussian_r = 6
+
+    cfg.lr = 0.0001
+    cfg.weight_decay = 0
+    cfg.flipped = True
+    cfg.store_img = False
+    cfg.model_weight_path = '/home/icecola/Desktop/KeyPointsDet/model/KeyPointV3-25800.tckpt'
+    cfg.model_optimizer_path = '/home/icecola/Desktop/KeyPointsDet/model/adam_optimizer-25800.tckpt'
+
     train = TrainProcessor(cfg)
     train.training()
-    '''
-    cv2.namedWindow("ResizeWindows", cv2.WINDOW_AUTOSIZE)
-    dir='/home/icecola/Desktop/KeyPointsDet/data/1_1'
-    pics=sorted(os.listdir(dir))
-    for pic in pics:
-        pic_name=os.path.join(dir,pic)
-        img=cv2.imread(pic_name,cv2.IMREAD_GRAYSCALE)
-        img_new_shape=(int(img.shape[0]/10),int(img.shape[1]/4))
-        new_img=cv2.resize(img,img_new_shape)
-        cv2.imshow("ResizeWindows",new_img)
-        cv2.waitKey()
-    '''
